@@ -129,6 +129,9 @@ pbr_input.material.uv_transform = uv_transform;
 
 @if(VERTEX_UVS && VERTEX_UVS_A)
     var uv = (uv_transform * vec3(in.uv, 1.0)).xy;
+@elif(VERTEX_UVS)
+    // A lightmap-only mesh (UV_1 without UV_0) samples its textures with UV_1 instead of failing to compile.
+    var uv = (uv_transform * vec3(in.uv_b, 1.0)).xy;
 
 // TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass
 @if(VERTEX_UVS && VERTEX_UVS_B)

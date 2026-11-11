@@ -15,9 +15,8 @@
 //! [`RenderLightmaps`] table, which lives in the render world. Mesh bindgroup
 //! and mesh uniform creation consults this table to determine which lightmap to
 //! supply to the shader. Essentially, the lightmap is a special type of texture
-//! that is part of the mesh instance rather than part of the material (because
-//! multiple meshes can share the same material, whereas sharing lightmaps is
-//! nonsensical).
+//! that is part of the mesh instance rather than part of the material. Multiple
+//! meshes may share an atlas image while retaining independent UV rectangles.
 //!
 //! Note that multiple meshes can't be drawn in a single drawcall if they use
 //! different lightmap textures, unless bindless textures are in use. If you
@@ -30,6 +29,9 @@
 //! [`MeshMaterial3d<StandardMaterial>`]: crate::StandardMaterial
 //! [`StandardMaterial`]: crate::StandardMaterial
 //! [`bevy-baked-gi`]: https://github.com/pcwalton/bevy-baked-gi
+
+mod shared_slots;
+use shared_slots::SharedSlots;
 
 use bevy_app::{App, Plugin};
 use bevy_asset::{AssetId, Handle};
@@ -47,16 +49,16 @@ use bevy_ecs::{
     template::FromTemplate,
 };
 use bevy_image::Image;
-use bevy_math::{uvec2, vec4, Rect, UVec2};
+use bevy_math::{Rect, UVec2, uvec2, vec4};
 use bevy_platform::collections::HashSet;
-use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+use bevy_reflect::{Reflect, std_traits::ReflectDefault};
 use bevy_render::{
+    Extract, ExtractSchedule, RenderApp, RenderStartup,
     render_asset::RenderAssets,
     render_resource::{Sampler, TextureView, WgpuSampler, WgpuTextureView},
     renderer::RenderAdapter,
     sync_world::MainEntity,
     texture::{FallbackImage, GpuImage},
-    Extract, ExtractSchedule, RenderApp, RenderStartup,
 };
 use bevy_render::{renderer::RenderDevice, sync_world::MainEntityHashMap};
 use bevy_utils::default;
@@ -64,7 +66,7 @@ use fixedbitset::FixedBitSet;
 use nonmax::{NonMaxU16, NonMaxU32};
 use tracing::error;
 
-use crate::{binding_arrays_are_usable, MeshExtractionSystems};
+use crate::{MeshExtractionSystems, binding_arrays_are_usable};
 
 /// The number of lightmaps that we store in a single slab, if bindless textures
 /// are in use.
@@ -129,14 +131,15 @@ pub(crate) struct RenderLightmap {
     /// If bindless lightmaps aren't in use, this will be 0.
     pub(crate) slot_index: LightmapSlotIndex,
 
+    image_id: AssetId<Image>,
+
     // Whether or not bicubic sampling should be used for this lightmap.
     pub(crate) bicubic_sampling: bool,
 }
 
 /// Stores data for all lightmaps in the render world.
 ///
-/// This is cleared and repopulated each frame during the `extract_lightmaps`
-/// system.
+/// Entries persist until their lightmap component is removed or replaced.
 #[derive(Resource)]
 pub struct RenderLightmaps {
     /// The mapping from every lightmapped entity to its lightmap info.
@@ -149,6 +152,8 @@ pub struct RenderLightmaps {
     pub(crate) slabs: Vec<LightmapSlab>,
 
     free_slabs: FixedBitSet,
+
+    shared_slots: SharedSlots,
 
     pending_lightmaps: HashSet<(LightmapSlabIndex, LightmapSlotIndex)>,
 
@@ -214,16 +219,26 @@ fn extract_lightmaps(
 
     // Loop over each entity.
     for (entity, view_visibility, lightmap) in changed_lightmaps_query.iter() {
-        if render_lightmaps
-            .render_lightmaps
-            .contains_key(&MainEntity::from(entity))
-        {
-            continue;
-        }
-
         // Only process visible entities.
         if !view_visibility.get() {
             continue;
+        }
+
+        // Atlas identity is shared; the UV rectangle and filtering remain per mesh.
+        if let Some(existing) = render_lightmaps
+            .render_lightmaps
+            .get_mut(&MainEntity::from(entity))
+        {
+            if existing.image_id == lightmap.image.id() {
+                existing.uv_rect = lightmap.uv_rect;
+                existing.bicubic_sampling = lightmap.bicubic_sampling;
+                continue;
+            }
+            let (old_image, old_slot) = (
+                existing.image_id,
+                (existing.slab_index, existing.slot_index),
+            );
+            render_lightmaps.release(&fallback_images, old_image, old_slot);
         }
 
         let (slab_index, slot_index) =
@@ -235,12 +250,18 @@ fn extract_lightmaps(
                 slab_index,
                 slot_index,
                 lightmap.bicubic_sampling,
+                lightmap.image.id(),
             ),
         );
 
-        render_lightmaps
-            .pending_lightmaps
-            .insert((slab_index, slot_index));
+        if render_lightmaps.slabs[usize::from(slab_index)].lightmaps[usize::from(slot_index)]
+            .asset_id
+            .is_some()
+        {
+            render_lightmaps
+                .pending_lightmaps
+                .insert((slab_index, slot_index));
+        }
     }
 
     for entity in removed_lightmaps_query.read() {
@@ -249,6 +270,7 @@ fn extract_lightmaps(
         }
 
         let Some(RenderLightmap {
+            image_id,
             slab_index,
             slot_index,
             ..
@@ -259,10 +281,7 @@ fn extract_lightmaps(
             continue;
         };
 
-        render_lightmaps.remove(&fallback_images, slab_index, slot_index);
-        render_lightmaps
-            .pending_lightmaps
-            .remove(&(slab_index, slot_index));
+        render_lightmaps.release(&fallback_images, image_id, (slab_index, slot_index));
     }
 
     render_lightmaps
@@ -294,12 +313,14 @@ impl RenderLightmap {
         slab_index: LightmapSlabIndex,
         slot_index: LightmapSlotIndex,
         bicubic_sampling: bool,
+        image_id: AssetId<Image>,
     ) -> Self {
         Self {
             uv_rect,
             slab_index,
             slot_index,
             bicubic_sampling,
+            image_id,
         }
     }
 }
@@ -341,6 +362,8 @@ pub fn init_render_lightmaps(
         render_lightmaps: default(),
         slabs: vec![],
         free_slabs: FixedBitSet::new(),
+        // QA A/B switch, sampled once; ordinary runs always share atlas slots.
+        shared_slots: SharedSlots::new(std::env::var_os("BEVY_PBR_LIGHTMAP_UNSHARED").is_none()),
         pending_lightmaps: default(),
         bindless_supported,
     });
@@ -362,6 +385,9 @@ impl RenderLightmaps {
         fallback_images: &FallbackImage,
         image_id: AssetId<Image>,
     ) -> (LightmapSlabIndex, LightmapSlotIndex) {
+        if let Some(slot) = self.shared_slots.acquire(image_id) {
+            return slot;
+        }
         let slab_index = match self.free_slabs.minimum() {
             None => self.create_slab(fallback_images),
             Some(slab_index) => slab_index.into(),
@@ -373,7 +399,21 @@ impl RenderLightmaps {
             self.free_slabs.remove(slab_index.into());
         }
 
+        self.shared_slots.insert(image_id, (slab_index, slot_index));
         (slab_index, slot_index)
+    }
+
+    fn release(
+        &mut self,
+        fallback_images: &FallbackImage,
+        image_id: AssetId<Image>,
+        slot: (LightmapSlabIndex, LightmapSlotIndex),
+    ) {
+        let Some((slab_index, slot_index)) = self.shared_slots.release(image_id, slot) else {
+            return;
+        };
+        self.remove(fallback_images, slab_index, slot_index);
+        self.pending_lightmaps.remove(&(slab_index, slot_index));
     }
 
     fn remove(
